@@ -1,0 +1,329 @@
+#! /usr/bin/perl
+#
+# allips
+#
+# Pure-perl, no-dependencies way of getting all the configured IP addresses 
+# on a linux system.
+# Annoyingly, the ipv6 subsystem has a really easy way to answer this question
+# (/proc/net/if_inet6) but there's no ipv4 analogue.
+#
+# Anyway, this uses five sources:
+#
+# /proc/net/udp & /proc/net/tcp
+#   which contain details about *currently open* sockets. So they'll list any 
+#   addresses that are sending or receiving packets, but not completely dormant
+#   ones. Apparently, this is about as reliable as it gets :/
+#   (disabled by passing '--noudp' and/or '--notcp' as arguments, respectively)
+# 
+# ifconfig
+#   which is, essentially the same as above but via ioctl rather than parsing
+#   ASCII. The output of the ioctl is, of course, rendered into ASCII and then
+#   parsed...
+#   (disabled by passing '--noifconfig' as an argument)
+#
+# iproute2
+#   the hipper, younger, alternative to ifconfig, known to its friends as 'ip'.
+#   Nobody seems to know how it works but, unlike ifconfig, it can deal with 
+#   one interface having more than one IP address (without having to do aliases
+#   like eth0:0).
+#   (disabled by passing '--noiproute2' as an argument)
+#
+# iptables' NATting
+#   Addresses that are just added to the NAT chain in iptables don't appear 
+#   anywhere else, but traffic addressed to them will be accepted, and they
+#   will be properly routed. We retrieve the source address of every SNAT rule
+#   and the destination address of every DNAT one.
+#   (disabled by passing '--nonat' as an argument)
+# 
+#
+#
+# If the iproute2 or the ifconfig commands fail, this'll just silently carry on.
+# 
+# Avi 2015-12-27
+
+use strict;
+use Getopt::Long;
+
+my ($no_tcp, $no_udp, $no_iproute2, $no_ifconfig, $no_nat, $help, $long_output) = undef;
+my @check_ip_addresses = ();
+my @check_no_ip_addresses = ();
+
+GetOptions(
+	"notcp"      => \$no_tcp,
+	"noudp"      => \$no_udp,
+	"noiproute2" => \$no_iproute2,
+	"noifconfig" => \$no_ifconfig,
+	"nonat"      => \$no_nat,
+	"present=s"  => \@check_ip_addresses,
+	"absent=s"   => \@check_no_ip_addresses,
+	"long"       => \$long_output,
+	"help"       => \$help,
+) or die ("Error parsing options: $!");
+
+usage_and_exit() if $help;
+
+if($no_udp and $no_tcp and $no_iproute2 and $no_ifconfig and $no_nat){
+	print STDERR "All sources disabled; exiting\n";
+	exit 0;
+}
+
+my $addresses = {};
+$addresses = proc_net($addresses, 'tcp') unless $no_tcp;
+$addresses = proc_net($addresses, 'udp') unless $no_udp;
+$addresses = iproute2($addresses)        unless $no_iproute2;
+$addresses = ifconfig($addresses)        unless $no_ifconfig;
+$addresses = nat($addresses)             unless $no_nat;
+
+# Count all the addresses:
+my @print_addresses;
+my $types = {};
+foreach my $address (sort(keys(%{$addresses}))){
+	next if $address eq '0.0.0.0';
+	# @print_addresses is an array of addresses that will be 
+	# join()ed in the output-printing bit below.
+	push(@print_addresses, $address);
+	# $types is a hashref whose keys are types of address 
+	# (public, private) and whose values are a count of the
+	# number of addresses of that type.
+	$types->{ classify_address($address) }++;
+}
+
+# Check for missing IP addresses:
+my @missing_ip_addresses;
+if($check_ip_addresses[0]){
+	my $missing = {};
+	foreach my $ip_address (@check_ip_addresses){
+		unless($addresses->{$ip_address}){
+			$missing->{$ip_address}++;
+		}
+	}
+	@missing_ip_addresses = sort(keys(%{$missing}));
+}
+
+my @mistakenly_present_ip_addresses;
+if($check_no_ip_addresses[0]){
+	my $present = {};
+	foreach my $ip_address (@check_no_ip_addresses){
+		if($addresses->{$ip_address}){
+			$present->{$ip_address}++;
+		}
+	}
+	@mistakenly_present_ip_addresses = sort(keys(%{$present}));
+}
+
+
+# We're now concerned with formatting and printing, we've done all the
+# checking and counting.
+
+# @counts is an array of strings describing the number of each type of
+# IP address ( ['public:3', 'private:4']) which can then be join()ed 
+# below in the output.
+my (@counts);
+foreach my $type (sort(keys(%{$types}))){
+	push(@counts, "$type:$types->{$type}");
+}
+
+
+if($long_output){
+	print "Types:\n\t";
+	print join("\n\t", @counts), "\n";
+	print "Addresses\n\t";
+	print join("\n\t", @print_addresses), "\n";
+	print "Missing:\n\t";
+	if($missing_ip_addresses[0]){
+		print join("\n\t", @missing_ip_addresses), "\n"
+	}else{
+		print "None\n";
+	}
+	print "Mistakenly present:\n\t";
+	if($mistakenly_present_ip_addresses[0]){
+		print join("\n\t", @mistakenly_present_ip_addresses), "\n";
+	}else{
+		print "None\n";
+	}
+	exit;
+}
+
+# Check for error conditions (absent IP addresses that should be present, and present
+# IP addresses that should be absent):
+my @errors;
+if($missing_ip_addresses[0]){
+	push(@errors, "Missing: ".join("; ", @missing_ip_addresses));
+}
+if($mistakenly_present_ip_addresses[0]){
+	push(@errors, "Present: ".join("; ", @mistakenly_present_ip_addresses));
+}
+
+# Finally, the output!
+if(@errors){
+	print join("|", @errors)." | ".join(",", @print_addresses)."\n";
+	exit 1;
+}
+
+print "IP address count: ".join(";", @counts)."|".join(",",@print_addresses)."\n";
+exit 0;
+
+# # #
+# #
+#
+
+# Parse /proc/net/tcp or /proc/net/udp
+sub proc_net{
+	my $addresses = shift;
+	my $protocol = shift;
+	my @sockets = column_from_file("/proc/net/".$protocol, 2);
+	foreach my $socket (@sockets){
+		next if $socket eq 'local_address';
+		my $address = to_dotted_quad(substr($socket, 0, 8));
+		$addresses->{ $address }++;
+	}
+	return($addresses);
+}
+
+# parse 'ip a' output
+sub iproute2{
+	my $addresses = shift;
+	my $ip_cmd = '/bin/ip -o -4 addr show 2>/dev/null';
+	my @output = `$ip_cmd`;
+
+	return $addresses unless $? == 0;
+
+	foreach my $line (@output){
+		next unless $line =~ m#^\d:\s+\w+\s+inet\s(\d+\.\d+\.\d+\.\d+)/\d\d?#;
+		$addresses->{ $1 }++;
+	}
+	return $addresses;
+}
+
+# parse ifconfig output
+sub ifconfig{
+	my $addresses = shift;
+	my $ifconfig_cmd = '/sbin/ifconfig -a 2>/dev/null';
+	my @output = `$ifconfig_cmd`;
+
+	return $addresses unless $? == 0;
+
+	foreach my $line (@output){
+		next unless $line =~ m#\s+inet addr:(\d+\.\d+\.\d+\.\d+)\s+#;
+		$addresses->{ $1 }++;
+	}
+	return $addresses;
+
+}
+# Parse the nat tables of iptables' output
+sub nat{
+	my $addresses = shift;
+	my $iptables_cmd = "iptables -n -L -t nat 2>/dev/null";
+	my @output = `$iptables_cmd`;
+	
+	return $addresses unless $? == 0;
+	
+	foreach my $line(@output){
+		my $address;
+		if($line =~ m/^DNAT/){
+			#DNAT; inbound traffic so we're interested in the dst column
+			$address = (split(m/\s+/, $line))[4];
+			$addresses->{$address}++;
+		}elsif($line =~ m/SNAT/){
+			#SNAT: outbound NAT, so we're interested in the src column
+			$address = (split(m/\s+/, $line))[3];
+			$addresses->{$address++};
+		}
+		# there's loads of lines of output in iptables that aren't interesting
+		# so we'll just ignore them and keep looping.
+	}
+	return $addresses;
+
+}
+
+# Given a path to a file and a column index, returns an array containing that
+# column from each line. Removes leading whitespace before counting columns.
+
+sub column_from_file{
+	my $file = shift;
+	my $column_number = shift;
+	$column_number--;
+	my @return;
+	open(my $fh, "<", $file);
+	while(my $line = readline($fh)){
+		chomp($line);
+		$line =~ s/^\s+//;
+		my $bit = (split(m/\s+/, $line))[$column_number];
+		push(@return,$bit);
+	}
+	return(@return);
+}
+
+# Convert from little-endian hex format (as used all over /proc) to normal 
+# dotted-quad (as used everywhere else).
+
+sub to_dotted_quad{
+	my $address = shift;
+	my @octets = ($address =~ m/../g);
+	my @address;
+	foreach my $octet (reverse(@octets)){
+		push(@address, hex($octet));
+	}
+	return join('.', @address);
+}
+
+sub classify_address{
+	my $address = shift;
+	return 'private'   if($address =~ m/^10\./);                            #rfc1918 (10.*.*.*)
+	return 'private'   if($address =~ m/^172\.([1[6-9]|2\d|3[0-2])\./);     #rfc1918 (172.16-32.*.*)
+	return 'private'   if($address =~ m/^192\.168\./);	                #rfc1918 (192.168.*.*)
+	return 'private'   if($address =~ m/^127\./);                           #loopback (127.*.*.*)
+	return 'zeroconf'  if($address =~ m/^169\.254\./);                      #DHCP zeroconf (169.254.*.*)
+	return 'private'   if($address =~ m/^192\.0\.2\./);	                #"well 192.0.2.0 is a well the network equiv of /dev/null"
+	return 'multicast' if($address =~ m/^203\.0\.113\./);                   # 203.9.113.*
+	return 'multicast' if($address =~ m/^(22[4-9]|2[3-5][0-9])/);           # 224-255.*.*.*
+
+	return 'public';
+}
+
+
+sub usage_and_exit{
+print <<EOF;
+
+allips
+
+(Try to) get all the IPv4 addresses on a linux machine.
+
+Usage:
+
+    allips [options]
+
+Options:
+
+  --present [address]
+       go critical if [address] is not detected. Repeat this option
+       to check multiple addresses.
+
+  --absent [address]
+       go critical if [address] *is* detected. Repeate this option 
+       to check multiple addresses.
+
+  --help
+       show this help
+
+  --long
+       show longer-form output, not suitable for Nagios (always exits
+       zero, too).
+
+Sources:
+
+   This makes use of a few sources for its data, and each one should
+   fail silently (perhaps alerting about missing addresses) if there's
+   any problems, but they can be disabled with these switches:
+
+	--notcp        /proc/net/tcp
+	--noudp        /proc/net/udp
+	--noiproute2   `ip a`
+	--noifconfig   `ifconfig -a`
+	--nonat        `iptables -n -L -t nat`
+
+  see the top of the script's source for a better explanation.
+
+EOF
+exit;
+}
